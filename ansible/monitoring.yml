@@ -131,7 +131,7 @@
 
             - job_name: 'rhel_server'
               static_configs:
-                - targets: ['10.0.2.35:9100']
+                - targets: ['{{ groups["targets"][0] }}:9100']
 
     - name: Create Prometheus systemd service
       copy:
@@ -167,6 +167,33 @@
     - name: Allow node_exporter port through firewalld on monitoring host
       firewalld:
         port: 9100/tcp
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: Add Grafana repo
+      yum_repository:
+        name: grafana
+        description: Grafana official repo
+        baseurl: https://rpm.grafana.com
+        gpgcheck: yes
+        gpgkey: https://rpm.grafana.com/gpg.key
+
+    - name: Install Grafana
+      yum:
+        name: grafana
+        state: present
+
+    - name: Start and enable Grafana
+      systemd:
+        name: grafana-server
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Allow Grafana port through firewalld
+      firewalld:
+        port: 3000/tcp
         permanent: yes
         state: enabled
         immediate: yes
