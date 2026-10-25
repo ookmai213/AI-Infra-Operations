@@ -1,0 +1,95 @@
+---
+- name: Deploy AI infrastructure operations webhook
+  hosts: monitoring
+  become: true
+
+  vars:
+    app_dir: /opt/ai-infra-ops
+
+  tasks:
+    - name: Ensure Python is installed
+      ansible.builtin.package:
+        name: python3
+        state: present
+
+    - name: Create service account
+      ansible.builtin.user:
+        name: infraops
+        system: true
+        create_home: false
+        shell: /sbin/nologin
+        state: present
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: infraops
+        group: infraops
+        mode: "0750"
+
+    - name: Copy application
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../app/main.py"
+        dest: "{{ app_dir }}/main.py"
+        owner: infraops
+        group: infraops
+        mode: "0640"
+      notify: Restart webhook
+
+    - name: Copy Python requirements
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../app/requirements.txt"
+        dest: "{{ app_dir }}/requirements.txt"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create Python virtual environment
+      ansible.builtin.command:
+        cmd: "python3 -m venv {{ app_dir }}/venv"
+        creates: "{{ app_dir }}/venv/bin/python"
+
+    - name: Install application dependencies
+      ansible.builtin.pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ app_dir }}/venv"
+      notify: Restart webhook
+
+    - name: Install systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ai-infra-ops.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=AI Infrastructure Operations Webhook
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=infraops
+          Group=infraops
+          WorkingDirectory={{ app_dir }}
+          Environment=PYTHONDONTWRITEBYTECODE=1
+          ExecStart={{ app_dir }}/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+          Restart=on-failure
+          RestartSec=5
+          NoNewPrivileges=true
+          PrivateTmp=true
+      notify: Restart webhook
+
+    - name: Enable and start webhook service
+      ansible.builtin.systemd:
+        name: ai-infra-ops
+        daemon_reload: true
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Restart webhook
+      ansible.builtin.systemd:
+        name: ai-infra-ops
+        daemon_reload: true
+        state: restarted

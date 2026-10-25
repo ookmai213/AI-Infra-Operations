@@ -7,3 +7,9 @@ venv/
 __pycache__/
 *.pyc
 .env
+
+# Terraform saved plans may contain sensitive data
+*.tfplan
+
+# Local Ansible inventory with environment-specific IPs
+ansible/inventory.ini

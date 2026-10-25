@@ -1,10 +1,14 @@
 ---
-- name: Install node_exporter on all hosts (RHEL server + monitoring server)
+- name: Install node_exporter on all hosts
   hosts: all
-  become: yes
+  become: true
+
   vars:
+    ansible_python_interpreter: /usr/libexec/platform-python
     node_exporter_version: "1.8.2"
-  tasks:
+
+  tasks: 
+
     - name: Download node_exporter
       get_url:
         url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
@@ -14,18 +18,19 @@
       unarchive:
         src: /tmp/node_exporter.tar.gz
         dest: /tmp
-        remote_src: yes
+        remote_src: true
 
     - name: Move node_exporter binary to /usr/local/bin
       copy:
         src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
         dest: /usr/local/bin/node_exporter
-        mode: '0755'
-        remote_src: yes
+        mode: "0755"
+        remote_src: true
 
     - name: Create node_exporter systemd service
       copy:
         dest: /etc/systemd/system/node_exporter.service
+        mode: "0644"
         content: |
           [Unit]
           Description=Node Exporter
@@ -42,33 +47,38 @@
       systemd:
         name: node_exporter
         state: started
-        enabled: yes
-        daemon_reload: yes
+        enabled: true
+        daemon_reload: true
 
-    - name: Allow node_exporter port through firewalld
-      firewalld:
-        port: 9100/tcp
-        permanent: yes
-        state: enabled
-        immediate: yes
-      ignore_errors: yes
 
-- name: Install Prometheus and Grafana on monitoring server only
+
+- name: Install Prometheus, Grafana and Alertmanager
   hosts: monitoring
-  become: yes
+  become: true
+
   vars:
+    ansible_python_interpreter: /usr/libexec/platform-python
     prometheus_version: "2.54.1"
+    alertmanager_version: "0.27.0"
+
   tasks:
-    - name: Install firewalld
+  
+    - name: Install firewalld and Python bindings
       yum:
-        name: firewalld
+        name:
+          - firewalld
+          - python3-firewall
         state: present
 
     - name: Start and enable firewalld
       systemd:
         name: firewalld
         state: started
-        enabled: yes
+        enabled: true  
+
+    # ---------------------------------------------------------
+    # PROMETHEUS
+    # ---------------------------------------------------------
 
     - name: Download Prometheus
       get_url:
@@ -79,13 +89,13 @@
       unarchive:
         src: /tmp/prometheus.tar.gz
         dest: /tmp
-        remote_src: yes
+        remote_src: true
 
     - name: Create prometheus user
       user:
         name: prometheus
         shell: /sbin/nologin
-        create_home: no
+        create_home: false
 
     - name: Create Prometheus directories
       file:
@@ -93,6 +103,7 @@
         state: directory
         owner: prometheus
         group: prometheus
+        mode: "0755"
       loop:
         - /etc/prometheus
         - /var/lib/prometheus
@@ -103,8 +114,8 @@
         dest: /usr/local/bin/prometheus
         owner: prometheus
         group: prometheus
-        mode: '0755'
-        remote_src: yes
+        mode: "0755"
+        remote_src: true
 
     - name: Copy promtool binary
       copy:
@@ -112,30 +123,123 @@
         dest: /usr/local/bin/promtool
         owner: prometheus
         group: prometheus
-        mode: '0755'
-        remote_src: yes
-    
+        mode: "0755"
+        remote_src: true
+
+    # ---------------------------------------------------------
+    # PROMETHEUS ALERT RULES
+    # ---------------------------------------------------------
+
+    - name: Create Prometheus alert rules
+      copy:
+        dest: /etc/prometheus/alert_rules.yml
+        owner: prometheus
+        group: prometheus
+        mode: "0644"
+        content: |
+          groups:
+            - name: infrastructure_alerts
+              rules:
+
+                - alert: ServerDown
+                  expr: up == 0
+                  for: 2m
+                  labels:
+                    severity: critical
+                  annotations:
+                    summary: "Monitored server is down"
+                    description: "A Prometheus target has been unreachable for more than 2 minutes."
+
+                - alert: HighMemoryUsage
+                  expr: |
+                    100 * (
+                      1 -
+                      (
+                        node_memory_MemAvailable_bytes
+                        /
+                        node_memory_MemTotal_bytes
+                      )
+                    ) > 90
+                  for: 5m
+                  labels:
+                    severity: warning
+                  annotations:
+                    summary: "High memory usage"
+                    description: "Memory usage has remained above 90% for more than 5 minutes."
+
+                - alert: DiskSpaceLow
+                  expr: |
+                    100 * (
+                      1 -
+                      (
+                        node_filesystem_avail_bytes{
+                          mountpoint="/",
+                          fstype!~"tmpfs|overlay"
+                        }
+                        /
+                        node_filesystem_size_bytes{
+                          mountpoint="/",
+                          fstype!~"tmpfs|overlay"
+                        }
+                      )
+                    ) > 85
+                  for: 5m
+                  labels:
+                    severity: warning
+                  annotations:
+                    summary: "Low disk space"
+                    description: "Root filesystem usage has remained above 85% for more than 5 minutes."
+      notify: restart prometheus
+
+    # ---------------------------------------------------------
+    # PROMETHEUS CONFIG
+    # ---------------------------------------------------------
+
     - name: Create Prometheus config file
       copy:
         dest: /etc/prometheus/prometheus.yml
         owner: prometheus
         group: prometheus
+        mode: "0644"
         content: |
           global:
             scrape_interval: 15s
 
-          scrape_configs:
-            - job_name: 'monitoring_server'
-              static_configs:
-                - targets: ['localhost:9100']
+          alerting:
+            alertmanagers:
+              - static_configs:
+                  - targets:
+                      - "localhost:9093"
 
-            - job_name: 'rhel_server'
+          rule_files:
+            - /etc/prometheus/alert_rules.yml
+
+          scrape_configs:
+            - job_name: "monitoring_server"
               static_configs:
-                - targets: ['{{ groups["targets"][0] }}:9100']
+                - targets:
+                    - "localhost:9100"
+
+            - job_name: "rhel_server"
+              static_configs:
+                - targets:
+                    - "{{ groups['targets'][0] }}:9100"
+      notify: restart prometheus
+
+    - name: Validate Prometheus configuration
+      command:
+        cmd: /usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
+      changed_when: false
+
+    - name: Validate Prometheus alert rules
+      command:
+        cmd: /usr/local/bin/promtool check rules /etc/prometheus/alert_rules.yml
+      changed_when: false
 
     - name: Create Prometheus systemd service
       copy:
         dest: /etc/systemd/system/prometheus.service
+        mode: "0644"
         content: |
           [Unit]
           Description=Prometheus
@@ -143,9 +247,12 @@
 
           [Service]
           User=prometheus
+          Group=prometheus
           ExecStart=/usr/local/bin/prometheus \
             --config.file=/etc/prometheus/prometheus.yml \
             --storage.tsdb.path=/var/lib/prometheus/
+
+          Restart=on-failure
 
           [Install]
           WantedBy=multi-user.target
@@ -154,29 +261,26 @@
       systemd:
         name: prometheus
         state: started
-        enabled: yes
-        daemon_reload: yes
+        enabled: true
+        daemon_reload: true
 
-    - name: Allow Prometheus port through firewalld
+    - name: Allow Prometheus through firewalld
       firewalld:
         port: 9090/tcp
-        permanent: yes
+        permanent: true
         state: enabled
-        immediate: yes
+        immediate: true
 
-    - name: Allow node_exporter port through firewalld on monitoring host
-      firewalld:
-        port: 9100/tcp
-        permanent: yes
-        state: enabled
-        immediate: yes
+    # ---------------------------------------------------------
+    # GRAFANA
+    # ---------------------------------------------------------
 
-    - name: Add Grafana repo
+    - name: Add Grafana repository
       yum_repository:
         name: grafana
-        description: Grafana official repo
+        description: Grafana official repository
         baseurl: https://rpm.grafana.com
-        gpgcheck: yes
+        gpgcheck: true
         gpgkey: https://rpm.grafana.com/gpg.key
 
     - name: Install Grafana
@@ -188,12 +292,130 @@
       systemd:
         name: grafana-server
         state: started
-        enabled: yes
-        daemon_reload: yes
+        enabled: true
+        daemon_reload: true
 
-    - name: Allow Grafana port through firewalld
+    - name: Allow Grafana through firewalld
       firewalld:
         port: 3000/tcp
-        permanent: yes
+        permanent: true
         state: enabled
-        immediate: yes
+        immediate: true
+
+    # ---------------------------------------------------------
+    # ALERTMANAGER
+    # ---------------------------------------------------------
+
+    - name: Download Alertmanager
+      get_url:
+        url: "https://github.com/prometheus/alertmanager/releases/download/v{{ alertmanager_version }}/alertmanager-{{ alertmanager_version }}.linux-amd64.tar.gz"
+        dest: /tmp/alertmanager.tar.gz
+
+    - name: Extract Alertmanager
+      unarchive:
+        src: /tmp/alertmanager.tar.gz
+        dest: /tmp
+        remote_src: true
+
+    - name: Create Alertmanager directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: "0755"
+      loop:
+        - /etc/alertmanager
+        - /var/lib/alertmanager
+
+    - name: Copy Alertmanager binary
+      copy:
+        src: "/tmp/alertmanager-{{ alertmanager_version }}.linux-amd64/alertmanager"
+        dest: /usr/local/bin/alertmanager
+        owner: prometheus
+        group: prometheus
+        mode: "0755"
+        remote_src: true
+
+    - name: Copy amtool binary
+      copy:
+        src: "/tmp/alertmanager-{{ alertmanager_version }}.linux-amd64/amtool"
+        dest: /usr/local/bin/amtool
+        owner: prometheus
+        group: prometheus
+        mode: "0755"
+        remote_src: true
+
+    - name: Create Alertmanager config file
+      copy:
+        dest: /etc/alertmanager/alertmanager.yml
+        owner: prometheus
+        group: prometheus
+        mode: "0644"
+        content: |
+          global:
+            resolve_timeout: 5m
+
+          route:
+            receiver: "default"
+
+          receivers:
+            - name: "default"
+              webhook_configs:
+                - url: "http://127.0.0.1:8000/webhook/alertmanager"
+                  send_resolved: true
+      notify: restart alertmanager
+
+    - name: Validate Alertmanager configuration
+      command:
+        cmd: /usr/local/bin/amtool check-config /etc/alertmanager/alertmanager.yml
+      changed_when: false
+
+    - name: Create Alertmanager systemd service
+      copy:
+        dest: /etc/systemd/system/alertmanager.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Alertmanager
+          After=network.target
+
+          [Service]
+          User=prometheus
+          Group=prometheus
+          ExecStart=/usr/local/bin/alertmanager \
+            --config.file=/etc/alertmanager/alertmanager.yml \
+            --storage.path=/var/lib/alertmanager/
+
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start and enable Alertmanager
+      systemd:
+        name: alertmanager
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Allow Alertmanager through firewalld
+      firewalld:
+        port: 9093/tcp
+        permanent: true
+        state: enabled
+        immediate: true
+
+  handlers:
+
+    - name: restart prometheus
+      systemd:
+        name: prometheus
+        state: restarted
+        daemon_reload: true
+
+    - name: restart alertmanager
+      systemd:
+        name: alertmanager
+        state: restarted
+        daemon_reload: true

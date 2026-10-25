@@ -68,6 +68,16 @@ resource "aws_security_group" "monitoring_sg" {
   }
 }
 
+resource "aws_vpc_security_group_ingress_rule" "prometheus_to_project1" {
+  security_group_id            = data.terraform_remote_state.project1.outputs.private_sg_id
+  referenced_security_group_id = aws_security_group.monitoring_sg.id
+
+  from_port   = 9100
+  to_port     = 9100
+  ip_protocol = "tcp"
+  description = "Prometheus scraping Node Exporter on Project 1 RHEL server"
+}
+
 data "aws_ami" "rhel" {
   most_recent = true
   owners      = ["309956199498"]
